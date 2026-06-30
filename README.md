@@ -17,7 +17,7 @@
 ### 1. 下载
 
 ```bash
-git clone https://github.com/你的用户名/insight.git
+git clone https://github.com/pipsqueakkk0613/insight.git
 cd insight
 npm install
 ```
