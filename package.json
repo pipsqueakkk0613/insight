@@ -1,0 +1,40 @@
+{
+  "name": "insight",
+  "version": "1.0.0",
+  "description": "洞察捕捉 — HTTP/SSE MCP 服务器，部署一次填 URL 即用，AI 自动识别并保存深度对话洞察",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "insight": "./index.js",
+    "insight-web": "./web.js"
+  },
+  "files": [
+    "index.js",
+    "web.js",
+    "storage.js",
+    "ui/",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "web": "node web.js"
+  },
+  "keywords": [
+    "mcp",
+    "sse",
+    "streamable-http",
+    "claude",
+    "insight",
+    "deep-talk",
+    "knowledge-management",
+    "ai-companion"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.21.0",
+    "sql.js": "^1.10.0",
+    "zod": "^3.23.0"
+  }
+}

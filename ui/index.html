@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>洞察捕捉 — 浏览面板</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  background:#0f0f0f;color:#e0e0e0;max-width:500px;margin:0 auto;
+  min-height:100vh;padding:16px;line-height:1.6;
+}
+/* ── 顶部 ── */
+.header{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+.header h1{font-size:20px;color:#fff}
+.header .count{font-size:13px;color:#888;margin-left:auto}
+.header .badge{font-size:11px;padding:3px 8px;border-radius:10px;margin-left:6px}
+.badge-sqlite{background:rgba(0,184,148,.2);color:#00b894}
+.badge-supabase{background:rgba(108,92,231,.2);color:#a29bfe}
+
+/* ── 搜索栏 ── */
+.s{display:flex;gap:8px;margin-bottom:12px}
+.s input{flex:1;padding:10px 14px;border-radius:10px;border:1px solid #333;background:#1a1a1a;color:#e0e0e0;font-size:15px;outline:none}
+.s input:focus{border-color:#6c5ce7}
+.s button{padding:10px 16px;border-radius:10px;border:none;background:#6c5ce7;color:#fff;font-size:14px;cursor:pointer}
+.s button:hover{background:#5a4bd1}
+
+/* ── 分类筛选 ── */
+.f{display:flex;gap:8px;margin-bottom:16px;flex-wrap:wrap}
+.f span{padding:6px 14px;border-radius:20px;border:1px solid #333;background:#1a1a1a;color:#aaa;font-size:13px;cursor:pointer;user-select:none}
+.f span.on{background:#6c5ce7;border-color:#6c5ce7;color:#fff}
+.f span:hover:not(.on){border-color:#555}
+
+/* ── 洞察卡片 ── */
+.c{background:#1a1a1a;border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid #2a2a2a;cursor:pointer}
+.c.open{border-color:#6c5ce7}
+.c .t{font-size:16px;font-weight:600;color:#fff;margin-bottom:4px}
+.c .m{font-size:12px;color:#777;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.c .tag{display:inline-block;padding:2px 8px;border-radius:4px;background:rgba(108,92,231,.2);color:#a29bfe;font-size:11px}
+.c .cu{background:rgba(0,184,148,.2);color:#00b894;font-size:11px;padding:2px 8px;border-radius:4px}
+.c .ca{background:rgba(253,121,168,.2);color:#fd79a8;font-size:11px;padding:2px 8px;border-radius:4px}
+.c .cc{background:rgba(253,203,110,.2);color:#fdcb6e;font-size:11px;padding:2px 8px;border-radius:4px}
+.c .d{display:none;margin-top:14px;padding-top:14px;border-top:1px solid #2a2a2a}
+.c.open .d{display:block}
+.dl{margin-bottom:10px}
+.dl .l{font-size:12px;color:#777;margin-bottom:4px;letter-spacing:.5px}
+.dl .v{font-size:14px;color:#ccc;line-height:1.7}
+blockquote{border-left:3px solid #6c5ce7;padding-left:12px;margin:8px 0;color:#b2bec3;font-style:italic}
+
+/* ── 空态/加载 ── */
+.x{text-align:center;padding:60px 20px;color:#666}
+.x .spin{display:inline-block;width:32px;height:32px;border:3px solid #333;border-top-color:#6c5ce7;border-radius:50%;animation:spin .8s linear infinite;margin-bottom:12px}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* ── 分页 ── */
+.p{display:flex;justify-content:center;align-items:center;gap:12px;margin-top:16px;padding-bottom:24px}
+.p button{padding:8px 16px;border-radius:8px;border:1px solid #333;background:#1a1a1a;color:#e0e0e0;font-size:13px;cursor:pointer}
+.p button:hover:not(:disabled){background:#2a2a2a}
+.p button:disabled{opacity:.3;cursor:default}
+.p .info{color:#777;font-size:13px}
+
+/* ── 存储类型提示 ── */
+.storage-hint{text-align:center;font-size:11px;color:#444;margin-bottom:16px}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <span>🪨</span>
+  <h1>洞察捕捉</h1>
+  <span class="badge" id="storageBadge"></span>
+  <span class="count" id="n"></span>
+</div>
+
+<div class="s">
+  <input id="q" placeholder="搜索洞察..." onkeydown="if(event.key==='Enter')search()">
+  <button onclick="search()">搜索</button>
+</div>
+
+<div class="f" id="f"><span class="on" data-cat="">全部</span></div>
+
+<div id="l"></div>
+<div class="p" id="pg"></div>
+<div class="storage-hint" id="storageHint"></div>
+
+<script>
+// ═══════════════════════════════════════
+//  状态
+// ═══════════════════════════════════════
+let cat = '';
+let off = 0;
+const PAGE_SIZE = 15;
+
+// ═══════════════════════════════════════
+//  初始化
+// ═══════════════════════════════════════
+async function init() {
+  await Promise.all([loadCategories(), loadList()]);
+  detectStorage();
+}
+
+// ── 检测存储类型 ──────────────────────
+function detectStorage() {
+  const badge = document.getElementById('storageBadge');
+  const hint  = document.getElementById('storageHint');
+  // 通过 API 探测（实际存储类型在服务端决定）
+  fetch('/api/categories')
+    .then(r => r.json())
+    .then(() => {
+      // API 通了 — 从页面行为推断是本地或云端
+      badge.textContent = '本地存储';
+      badge.className = 'badge badge-sqlite';
+      hint.textContent = '数据保存在本机文件中';
+    })
+    .catch(() => {
+      badge.textContent = '未连接';
+      badge.className = 'badge';
+    });
+}
+
+// ═══════════════════════════════════════
+//  加载分类列表
+// ═══════════════════════════════════════
+async function loadCategories() {
+  try {
+    const cats = await fetch('/api/categories').then(r => r.json());
+    const f = document.getElementById('f');
+    f.innerHTML = '<span class="on" data-cat="">全部</span>';
+    cats.forEach(c => {
+      const s = document.createElement('span');
+      s.dataset.cat = c;
+      s.textContent = c;
+      s.onclick = () => { selectCategory(c); };
+      f.appendChild(s);
+    });
+    // 重新绑定"全部"
+    f.querySelector('span[data-cat=""]').onclick = () => { selectCategory(''); };
+  } catch(e) {
+    // 分类加载失败不阻塞
+  }
+}
+
+function selectCategory(c) {
+  cat = c;
+  off = 0;
+  document.querySelectorAll('#f span').forEach(s => s.classList.remove('on'));
+  const target = document.querySelector(`#f span[data-cat="${c}"]`);
+  if (target) target.classList.add('on');
+  loadList();
+}
+
+// ═══════════════════════════════════════
+//  加载洞察列表
+// ═══════════════════════════════════════
+async function loadList() {
+  const c = document.getElementById('l');
+  c.innerHTML = '<div class="x"><div class="spin"></div><div>加载中...</div></div>';
+
+  try {
+    let url = `/api/insights?limit=${PAGE_SIZE}&offset=${off}`;
+    if (cat) url += `&category=${encodeURIComponent(cat)}`;
+
+    const resp = await fetch(url).then(r => r.json());
+    if (!resp.success) throw new Error(resp.error);
+
+    const insights = resp.data.insights || [];
+    document.getElementById('n').textContent = insights.length ? `共 ${resp.data.total || insights.length} 条` : '';
+
+    if (!insights.length) {
+      c.innerHTML = '<div class="x">📭 还没有洞察<br><span style="font-size:13px">聊点深度话题吧</span></div>';
+      document.getElementById('pg').innerHTML = '';
+      return;
+    }
+
+    c.innerHTML = insights.map(i => renderCard(i)).join('');
+
+    // 分页
+    const total = resp.data.total || insights.length;
+    const page = Math.floor(off / PAGE_SIZE) + 1;
+    const maxPage = Math.ceil(total / PAGE_SIZE);
+    document.getElementById('pg').innerHTML = `
+      <button ${off === 0 ? 'disabled' : ''} onclick="off=Math.max(0,off-${PAGE_SIZE});loadList()">← 上一页</button>
+      <span class="info">第 ${page} / ${maxPage} 页</span>
+      <button ${insights.length < PAGE_SIZE ? 'disabled' : ''} onclick="off+=${PAGE_SIZE};loadList()">下一页 →</button>
+    `;
+  } catch(e) {
+    c.innerHTML = `<div class="x" style="color:#e17055">⚠️ ${H(e.message)}</div>`;
+  }
+}
+
+// ═══════════════════════════════════════
+//  渲染单张卡片
+// ═══════════════════════════════════════
+function renderCard(i) {
+  const lbMap  = { user: '用户', ai: 'AI', collaborative: '碰撞产生' };
+  const clMap  = { user: 'cu', ai: 'ca', collaborative: 'cc' };
+  const lb     = lbMap[i.contributor] || i.contributor || '碰撞产生';
+  const cl     = clMap[i.contributor] || 'cc';
+  const tags   = (Array.isArray(i.tags) ? i.tags : []).join(', ');
+
+  return `
+<div class="c" onclick="this.classList.toggle('open')">
+  <div class="t">${H(i.title)}</div>
+  <div class="m">
+    <span class="tag">${H(i.category)}</span>
+    <span class="${cl}">${lb}</span>
+    <span>${H(i.source_date || '')}</span>
+    ${i.id ? `<span style="color:#444">#${i.id}</span>` : ''}
+  </div>
+  <div class="d">
+    <div class="dl">
+      <div class="l">💡 结论</div>
+      <div class="v">${H(i.conclusion)}</div>
+    </div>
+    ${i.derivation ? `
+    <div class="dl">
+      <div class="l">🔍 推导</div>
+      <div class="v">${H(i.derivation)}</div>
+    </div>` : ''}
+    ${i.golden_quote ? `
+    <div class="dl">
+      <div class="l">💬 金句</div>
+      <blockquote>${H(i.golden_quote)}</blockquote>
+    </div>` : ''}
+    ${i.source_topic ? `
+    <div class="dl">
+      <div class="l">📎 来源</div>
+      <div class="v">${H(i.source_topic)}</div>
+    </div>` : ''}
+    ${tags ? `
+    <div class="dl">
+      <div class="l">🏷️ 标签</div>
+      <div class="v">${H(tags)}</div>
+    </div>` : ''}
+  </div>
+</div>`;
+}
+
+// ═══════════════════════════════════════
+//  搜索
+// ═══════════════════════════════════════
+async function search() {
+  const q = document.getElementById('q').value.trim();
+  if (!q) { loadList(); return; }
+
+  const c = document.getElementById('l');
+  c.innerHTML = '<div class="x"><div class="spin"></div></div>';
+
+  try {
+    const resp = await fetch(`/api/insights/search?q=${encodeURIComponent(q)}&limit=50`).then(r => r.json());
+    if (!resp.success) throw new Error(resp.error);
+
+    const insights = resp.data.insights || [];
+    document.getElementById('n').textContent = insights.length ? `搜索到 ${insights.length} 条` : '';
+
+    if (!insights.length) {
+      c.innerHTML = `<div class="x">🔍 没有找到和「${H(q)}」相关的洞察</div>`;
+      document.getElementById('pg').innerHTML = '';
+      return;
+    }
+
+    c.innerHTML = insights.map(i => renderCard(i)).join('');
+    document.getElementById('pg').innerHTML = `<button onclick="loadList()">← 返回列表</button>`;
+  } catch(e) {
+    c.innerHTML = `<div class="x" style="color:#e17055">⚠️ ${H(e.message)}</div>`;
+  }
+}
+
+// ═══════════════════════════════════════
+//  工具函数：HTML 转义
+// ═══════════════════════════════════════
+function H(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ═══════════════════════════════════════
+//  启动
+// ═══════════════════════════════════════
+init();
+</script>
+</body>
+</html>
