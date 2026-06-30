@@ -35,7 +35,7 @@ const PORT = parseInt(process.env.PORT || '3456', 10);
 function createMcpServer() {
   const server = new McpServer({
     name: 'insight',
-    version: '2.0.0',
+    version: '3.0.0',
   }, {
     capabilities: { logging: {} },
   });
@@ -93,8 +93,11 @@ function createMcpServer() {
       tags:             z.string().optional().describe('标签，逗号分隔'),
       insight_type:     z.string().optional().describe('insight / self_cognition / stance / event'),
       why_captured:     z.string().optional().describe('AI 判定触发的原因'),
-      trigger_sentence: z.string().optional().describe('触发捕捉的对话原句'),
-      confidence:       z.number().optional().describe('自信度 0-1，默认 0.5'),
+      trigger_sentence:  z.string().optional().describe('触发捕捉的对话原句'),
+      confidence:        z.number().optional().describe('自信度 0-1，默认 0.5'),
+      privacy:           z.string().optional().describe('隐私级别：low（普通）/ medium（自我相关，默认）/ high（亲密/身体/情绪崩溃，不入长期记忆除非授权）'),
+      context:           z.string().optional().describe('前后对话的简短摘要，帮助后续确认时理解上下文'),
+      suggested_action:  z.string().optional().describe('AI 建议的处理方式：keep（入库）/ merge（合并）/ demote（降权为事件）/ discard（丢弃）'),
     },
     async (params) => {
       const result = await storage.capture_pending(params);
@@ -125,6 +128,19 @@ action 取值：
     },
     async (params) => {
       const result = await storage.confirm_pending(params);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'list_self',
+    '列出关于"我是谁/我怎么看待关系/长期姿态"的独立存储洞察（self_insights 表）。与事件类洞察分库存储，隐私更安全。',
+    {
+      limit:  z.number().optional().describe('每页条数，默认 20'),
+      offset: z.number().optional().describe('偏移量，默认 0'),
+    },
+    async (params) => {
+      const result = await storage.list_self(params);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );

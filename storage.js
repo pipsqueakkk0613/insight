@@ -76,9 +76,17 @@ class SQLiteBackend {
       )
     `);
 
-    // 迁移：v1 → v2 新字段（忽略 "duplicate column" 错误）
+    // 迁移：v1 → v2 新字段
     this._migrateAddColumn('insights', 'why_captured', "TEXT DEFAULT ''");
     this._migrateAddColumn('insights', 'insight_type', "TEXT DEFAULT 'insight'");
+
+    // 迁移：v2 → v3 防静默失败字段
+    this._migrateAddColumn('pending_insights', 'privacy', "TEXT DEFAULT 'low'");
+    this._migrateAddColumn('pending_insights', 'context', "TEXT DEFAULT ''");
+    this._migrateAddColumn('pending_insights', 'suggested_action', "TEXT DEFAULT 'keep'");
+    this._migrateAddColumn('pending_insights', 'retry_count', "INTEGER DEFAULT 0");
+    this._migrateAddColumn('pending_insights', 'content_hash', "TEXT DEFAULT ''");
+    this._migrateAddColumn('pending_insights', 'last_error', "TEXT DEFAULT ''");
 
     // 候选层
     this.db.run(`
@@ -97,9 +105,36 @@ class SQLiteBackend {
         why_captured    TEXT    DEFAULT '',
         trigger_sentence TEXT   DEFAULT '',
         confidence      REAL    DEFAULT 0.5,
+        privacy         TEXT    DEFAULT 'low',
+        context         TEXT    DEFAULT '',
+        suggested_action TEXT   DEFAULT 'keep',
+        retry_count     INTEGER DEFAULT 0,
+        content_hash    TEXT    DEFAULT '',
+        last_error      TEXT    DEFAULT '',
         status          TEXT    DEFAULT 'pending',
         created_at      TEXT    DEFAULT (datetime('now','localtime')),
         updated_at      TEXT    DEFAULT (datetime('now','localtime'))
+      )
+    `);
+
+    // self/stance 独立表
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS self_insights (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        title        TEXT    NOT NULL,
+        category     TEXT    NOT NULL DEFAULT '自我认知',
+        conclusion   TEXT    NOT NULL,
+        derivation   TEXT    DEFAULT '',
+        contributor  TEXT    DEFAULT 'collaborative',
+        golden_quote TEXT    DEFAULT '',
+        source_date  TEXT    DEFAULT '',
+        source_topic TEXT    DEFAULT '',
+        tags         TEXT    DEFAULT '[]',
+        insight_type TEXT    DEFAULT 'self_cognition',
+        why_captured TEXT    DEFAULT '',
+        privacy      TEXT    DEFAULT 'medium',
+        created_at   TEXT    DEFAULT (datetime('now','localtime')),
+        updated_at   TEXT    DEFAULT (datetime('now','localtime'))
       )
     `);
 
@@ -146,7 +181,7 @@ class SQLiteBackend {
     return null;
   }
 
-  // ── 辅助：tags 处理 ────────────────────
+  // ── 辅助：tags / hash ──────────────
   _parseTags(tagsStr) {
     if (!tagsStr) return [];
     if (Array.isArray(tagsStr)) return tagsStr;
@@ -161,46 +196,140 @@ class SQLiteBackend {
     return '[]';
   }
 
-  // ── 创建 ──────────────────────────────
+  _contentHash(title, conclusion) {
+    // 简单幂等：标题+结论的 hash
+    let h = 0;
+    const s = (title + '|' + conclusion);
+    for (let i = 0; i < s.length; i++) {
+      h = ((h << 5) - h) + s.charCodeAt(i);
+      h |= 0;
+    }
+    return String(h);
+  }
+
+  // ── 幂等检查 ──────────────────────────
+  _isDuplicate(hash) {
+    if (!hash) return false;
+    const exists = this._query(
+      'SELECT id FROM insights WHERE why_captured LIKE ? LIMIT 1',
+      ['%hash:' + hash + '%']
+    );
+    if (exists.length > 0) return true;
+    const selfExists = this._query(
+      "SELECT id FROM self_insights WHERE why_captured LIKE ? LIMIT 1",
+      ['%hash:' + hash + '%']
+    );
+    if (selfExists.length > 0) return true;
+    const pendingExists = this._query(
+      'SELECT id FROM pending_insights WHERE content_hash = ? AND status IN (?, ?) LIMIT 1',
+      [hash, 'pending', 'failed']
+    );
+    return pendingExists.length > 0;
+  }
+
+  // ── 重试 pending 队列 ──────────────────
+  _retryPending() {
+    const failed = this._query(
+      "SELECT * FROM pending_insights WHERE status IN ('pending','failed') ORDER BY created_at ASC LIMIT 10"
+    );
+    for (const row of failed) {
+      try {
+        if (this._isDuplicate(row.content_hash)) {
+          this._run("UPDATE pending_insights SET status='dropped', last_error='duplicate on retry', updated_at=datetime('now','localtime') WHERE id=?", [row.id]);
+          continue;
+        }
+        this._run(
+          `INSERT INTO insights (title, category, conclusion, derivation, contributor,
+            golden_quote, source_date, source_topic, tags, insight_type, why_captured)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [row.title, row.category, row.conclusion, row.derivation, row.contributor,
+           row.golden_quote, row.source_date, row.source_topic, row.tags, row.insight_type,
+           (row.why_captured || '') + ' [auto-retry]']
+        );
+        this._run("UPDATE pending_insights SET status='kept', retry_count=retry_count+1, updated_at=datetime('now','localtime') WHERE id=?", [row.id]);
+      } catch (e) {
+        this._run("UPDATE pending_insights SET retry_count=retry_count+1, last_error=?, status=CASE WHEN retry_count >= 3 THEN 'dead' ELSE 'failed' END, updated_at=datetime('now','localtime') WHERE id=?", [e.message.substring(0, 200), row.id]);
+      }
+    }
+    if (failed.length > 0) this._save();
+  }
+
+  // ── 创建（三态返回 + 防静默失败）─────
   async capture(params) {
     const { title, category, conclusion, derivation, contributor,
             golden_quote, source_date, source_topic, tags,
             insight_type, why_captured } = params;
 
-    if (!title)      return { success: false, error: 'title（标题）不能为空' };
-    if (!category)   return { success: false, error: 'category（分类）不能为空' };
-    if (!conclusion) return { success: false, error: 'conclusion（一句话结论）不能为空' };
+    if (!title)      return { success: false, status: 'failed', error: 'title（标题）不能为空' };
+    if (!category)   return { success: false, status: 'failed', error: 'category（分类）不能为空' };
+    if (!conclusion) return { success: false, status: 'failed', error: 'conclusion（一句话结论）不能为空' };
 
+    // 重试 pending 队列
+    this._retryPending();
+
+    const hash = this._contentHash(title, conclusion);
+
+    // 幂等检查
+    if (this._isDuplicate(hash)) {
+      return { success: true, status: 'saved', data: { message: '已存在，跳过重复 ✅' } };
+    }
+
+    const itype = insight_type || 'insight';
     try {
+      // self/stance 类进独立表
+      if (itype === 'self_cognition' || itype === 'stance') {
+        this.db.run(
+          `INSERT INTO self_insights (title, category, conclusion, derivation, contributor,
+            golden_quote, source_date, source_topic, tags, insight_type, why_captured, privacy)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [title, category, conclusion, derivation || '', contributor || 'collaborative',
+           golden_quote || '', source_date || '', source_topic || '',
+           this._serializeTags(tags), itype, (why_captured || '') + ' hash:' + hash, 'medium']
+        );
+        const id = this._lastInsertId();
+        this._save();
+        const row = this._query('SELECT * FROM self_insights WHERE id = ?', [id])[0];
+        return { success: true, status: 'saved', data: { message: '自我认知已保存 🧠', insight: row, table: 'self_insights' } };
+      }
+
       this.db.run(
         `INSERT INTO insights (title, category, conclusion, derivation, contributor,
           golden_quote, source_date, source_topic, tags, insight_type, why_captured)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          title,
-          category,
-          conclusion,
-          derivation || '',
-          contributor || 'collaborative',
-          golden_quote || '',
-          source_date || '',
-          source_topic || '',
-          this._serializeTags(tags),
-          insight_type || 'insight',
-          why_captured || '',
-        ]
+        [title, category, conclusion, derivation || '', contributor || 'collaborative',
+         golden_quote || '', source_date || '', source_topic || '',
+         this._serializeTags(tags), itype, (why_captured || '') + ' hash:' + hash]
       );
       const id = this._lastInsertId();
       this._save();
       const row = this._query('SELECT * FROM insights WHERE id = ?', [id])[0];
-      return { success: true, data: { message: '洞察已保存 ✅', insight: row } };
+      return { success: true, status: 'saved', data: { message: '洞察已保存 ✅', insight: row } };
     } catch (e) {
-      return { success: false, error: `保存失败: ${e.message}` };
+      // 静默失败保护：暂存到 pending 队列
+      const errMsg = e.message.substring(0, 200);
+      console.error('[洞察捕捉] 保存失败，暂存到 pending:', errMsg);
+      try {
+        this.db.run(
+          `INSERT INTO pending_insights (title, category, conclusion, derivation, contributor,
+            golden_quote, source_date, source_topic, tags, insight_type, why_captured,
+            trigger_sentence, confidence, privacy, content_hash, last_error, status)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'failed')`,
+          [title, category, conclusion, derivation || '', contributor || 'collaborative',
+           golden_quote || '', source_date || '', source_topic || '',
+           this._serializeTags(tags), itype, why_captured || '',
+           '', 0.8, 'low', hash, errMsg]
+        );
+        this._save();
+        return { success: true, status: 'pending', data: { message: '写入失败，已暂存到本地队列，下次对话自动重试 📥', error_detail: errMsg } };
+      } catch (e2) {
+        return { success: false, status: 'failed', error: `保存失败且暂存也失败: ${errMsg}` };
+      }
     }
   }
 
-  // ── 列表 ──────────────────────────────
+  // ── 列表（含自动重试）──────────────
   async list(params) {
+    this._retryPending(); // 每次列表操作自动重试失败的 pending
     const { category, insight_type, limit = 20, offset = 0 } = params || {};
     try {
       const conditions = [];
@@ -331,16 +460,27 @@ class SQLiteBackend {
   async capture_pending(params) {
     const { title, category, conclusion, derivation, contributor,
             golden_quote, source_date, source_topic, tags,
-            insight_type, why_captured, trigger_sentence, confidence } = params;
+            insight_type, why_captured, trigger_sentence, confidence,
+            privacy, context, suggested_action } = params;
 
     if (!title)      return { success: false, error: 'title（标题）不能为空' };
     if (!conclusion) return { success: false, error: 'conclusion（一句话结论）不能为空' };
 
+    const itype = insight_type || 'insight';
+    const priv = privacy || (itype === 'self_cognition' || itype === 'stance' ? 'medium' : 'low');
+
     try {
+      const hash = this._contentHash(title, conclusion);
+      // 幂等检查
+      if (this._isDuplicate(hash)) {
+        return { success: true, data: { message: '候选已存在，跳过重复' } };
+      }
+
       this.db.run(
         `INSERT INTO pending_insights (title, category, conclusion, derivation, contributor,
-          golden_quote, source_date, source_topic, tags, insight_type, why_captured, trigger_sentence, confidence)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          golden_quote, source_date, source_topic, tags, insight_type, why_captured,
+          trigger_sentence, confidence, privacy, context, suggested_action, content_hash)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           title,
           category || '待分类',
@@ -351,10 +491,14 @@ class SQLiteBackend {
           source_date || '',
           source_topic || '',
           this._serializeTags(tags),
-          insight_type || 'insight',
+          itype,
           why_captured || '',
           trigger_sentence || '',
           confidence ?? 0.5,
+          priv,
+          context || '',
+          suggested_action || 'keep',
+          hash,
         ]
       );
       const id = this._lastInsertId();
@@ -430,11 +574,36 @@ class SQLiteBackend {
 
   // ═══════════════════════════════════
 
+  // ── Self 表查询 ─────────────────────
+  async list_self(params) {
+    const { limit = 20, offset = 0 } = params || {};
+    try {
+      const rows = this._query(
+        'SELECT * FROM self_insights ORDER BY created_at DESC LIMIT ? OFFSET ?',
+        [limit, offset]
+      );
+      const total = this._query('SELECT COUNT(*) as total FROM self_insights')[0]?.total || 0;
+      return {
+        success: true,
+        data: {
+          count: rows.length,
+          total,
+          insights: rows.map(r => ({ ...r, tags: this._parseTags(r.tags) })),
+          hint: rows.length === 0 ? '还没有关于自我的洞察 🧠' : null,
+        },
+      };
+    } catch (e) {
+      return { success: false, error: `查询失败: ${e.message}` };
+    }
+  }
+
   // ── 分类列表 ──────────────────────────
   async getCategories() {
     try {
       const rows = this._query('SELECT DISTINCT category FROM insights ORDER BY category ASC');
-      return rows.map(r => r.category);
+      const selfRows = this._query('SELECT DISTINCT category FROM self_insights ORDER BY category ASC');
+      const all = [...new Set([...rows.map(r => r.category), ...selfRows.map(r => r.category)])];
+      return all;
     } catch (e) {
       return [];
     }
@@ -592,6 +761,10 @@ class SupabaseBackend {
     } catch (e) {
       return { success: false, error: e.message };
     }
+  }
+
+  async list_self(_params) {
+    return { success: true, data: { count: 0, total: 0, insights: [], hint: 'Supabase 模式暂不支持 self_insights' } };
   }
 
   async getCategories() {
