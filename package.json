@@ -34,7 +34,9 @@
     "@modelcontextprotocol/sdk": "^1.0.0",
     "dotenv": "^17.4.2",
     "express": "^4.21.0",
+    "socks": "^2.8.9",
     "sql.js": "^1.10.0",
+    "ssh2": "^1.17.0",
     "zod": "^3.23.0"
   }
 }

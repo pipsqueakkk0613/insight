@@ -56,8 +56,9 @@ class SQLiteBackend {
     return backend;
   }
 
-  // ── 建表 ──────────────────────────────
+  // ── 建表 + 迁移 ──────────────────────
   _initTable() {
+    // 主表
     this.db.run(`
       CREATE TABLE IF NOT EXISTS insights (
         id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,7 +75,40 @@ class SQLiteBackend {
         updated_at   TEXT    DEFAULT (datetime('now','localtime'))
       )
     `);
+
+    // 迁移：v1 → v2 新字段（忽略 "duplicate column" 错误）
+    this._migrateAddColumn('insights', 'why_captured', "TEXT DEFAULT ''");
+    this._migrateAddColumn('insights', 'insight_type', "TEXT DEFAULT 'insight'");
+
+    // 候选层
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS pending_insights (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        title           TEXT    NOT NULL,
+        category        TEXT    NOT NULL DEFAULT '待分类',
+        conclusion      TEXT    NOT NULL,
+        derivation      TEXT    DEFAULT '',
+        contributor     TEXT    DEFAULT 'collaborative',
+        golden_quote    TEXT    DEFAULT '',
+        source_date     TEXT    DEFAULT '',
+        source_topic    TEXT    DEFAULT '',
+        tags            TEXT    DEFAULT '[]',
+        insight_type    TEXT    DEFAULT 'insight',
+        why_captured    TEXT    DEFAULT '',
+        trigger_sentence TEXT   DEFAULT '',
+        confidence      REAL    DEFAULT 0.5,
+        status          TEXT    DEFAULT 'pending',
+        created_at      TEXT    DEFAULT (datetime('now','localtime')),
+        updated_at      TEXT    DEFAULT (datetime('now','localtime'))
+      )
+    `);
+
     this._save();
+  }
+
+  _migrateAddColumn(table, column, colDef) {
+    try { this.db.run(`ALTER TABLE ${table} ADD COLUMN ${column} ${colDef}`); }
+    catch (_) { /* 列已存在，跳过 */ }
   }
 
   // ── 持久化到磁盘 ──────────────────────
@@ -130,7 +164,8 @@ class SQLiteBackend {
   // ── 创建 ──────────────────────────────
   async capture(params) {
     const { title, category, conclusion, derivation, contributor,
-            golden_quote, source_date, source_topic, tags } = params;
+            golden_quote, source_date, source_topic, tags,
+            insight_type, why_captured } = params;
 
     if (!title)      return { success: false, error: 'title（标题）不能为空' };
     if (!category)   return { success: false, error: 'category（分类）不能为空' };
@@ -139,8 +174,8 @@ class SQLiteBackend {
     try {
       this.db.run(
         `INSERT INTO insights (title, category, conclusion, derivation, contributor,
-          golden_quote, source_date, source_topic, tags)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          golden_quote, source_date, source_topic, tags, insight_type, why_captured)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           title,
           category,
@@ -151,6 +186,8 @@ class SQLiteBackend {
           source_date || '',
           source_topic || '',
           this._serializeTags(tags),
+          insight_type || 'insight',
+          why_captured || '',
         ]
       );
       const id = this._lastInsertId();
@@ -164,20 +201,28 @@ class SQLiteBackend {
 
   // ── 列表 ──────────────────────────────
   async list(params) {
-    const { category, limit = 20, offset = 0 } = params || {};
+    const { category, insight_type, limit = 20, offset = 0 } = params || {};
     try {
-      let sql, countSql, queryParams, countParams;
+      const conditions = [];
+      const queryParams = [];
+      const countParams = [];
+
       if (category) {
-        sql = 'SELECT * FROM insights WHERE category = ? ORDER BY created_at DESC LIMIT ? OFFSET ?';
-        countSql = 'SELECT COUNT(*) as total FROM insights WHERE category = ?';
-        queryParams = [category, limit, offset];
-        countParams = [category];
-      } else {
-        sql = 'SELECT * FROM insights ORDER BY created_at DESC LIMIT ? OFFSET ?';
-        countSql = 'SELECT COUNT(*) as total FROM insights';
-        queryParams = [limit, offset];
-        countParams = [];
+        conditions.push('category = ?');
+        queryParams.push(category);
+        countParams.push(category);
       }
+      if (insight_type) {
+        conditions.push('insight_type = ?');
+        queryParams.push(insight_type);
+        countParams.push(insight_type);
+      }
+
+      const where = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
+      const sql = `SELECT * FROM insights ${where} ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+      const countSql = `SELECT COUNT(*) as total FROM insights ${where}`;
+
+      queryParams.push(limit, offset);
 
       const rows = this._query(sql, queryParams);
       const countResult = this._query(countSql, countParams);
@@ -278,6 +323,112 @@ class SQLiteBackend {
       return { success: false, error: `删除失败: ${e.message}` };
     }
   }
+
+  // ═══════════════════════════════════
+  //  候选层 (Pending)
+  // ═══════════════════════════════════
+
+  async capture_pending(params) {
+    const { title, category, conclusion, derivation, contributor,
+            golden_quote, source_date, source_topic, tags,
+            insight_type, why_captured, trigger_sentence, confidence } = params;
+
+    if (!title)      return { success: false, error: 'title（标题）不能为空' };
+    if (!conclusion) return { success: false, error: 'conclusion（一句话结论）不能为空' };
+
+    try {
+      this.db.run(
+        `INSERT INTO pending_insights (title, category, conclusion, derivation, contributor,
+          golden_quote, source_date, source_topic, tags, insight_type, why_captured, trigger_sentence, confidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          title,
+          category || '待分类',
+          conclusion,
+          derivation || '',
+          contributor || 'collaborative',
+          golden_quote || '',
+          source_date || '',
+          source_topic || '',
+          this._serializeTags(tags),
+          insight_type || 'insight',
+          why_captured || '',
+          trigger_sentence || '',
+          confidence ?? 0.5,
+        ]
+      );
+      const id = this._lastInsertId();
+      this._save();
+      const row = this._query('SELECT * FROM pending_insights WHERE id = ?', [id])[0];
+      return { success: true, data: { message: '候选洞察已暂存 📥', pending: row } };
+    } catch (e) {
+      return { success: false, error: `暂存失败: ${e.message}` };
+    }
+  }
+
+  async review_pending(params) {
+    const { limit = 10 } = params || {};
+    try {
+      const rows = this._query(
+        'SELECT * FROM pending_insights WHERE status = ? ORDER BY created_at ASC LIMIT ?',
+        ['pending', limit]
+      );
+      return {
+        success: true,
+        data: {
+          count: rows.length,
+          pending: rows.map(r => ({ ...r, tags: this._parseTags(r.tags) })),
+          hint: rows.length === 0 ? '没有待确认的候选洞察 ✅' : null,
+        },
+      };
+    } catch (e) {
+      return { success: false, error: `查询失败: ${e.message}` };
+    }
+  }
+
+  async confirm_pending(params) {
+    const { id, action } = params; // action: 'keep' | 'merge' | 'drop'
+    if (!id) return { success: false, error: 'id 不能为空' };
+
+    try {
+      const pending = this._query('SELECT * FROM pending_insights WHERE id = ?', [id])[0];
+      if (!pending) return { success: false, error: `没有找到 ID 为 ${id} 的候选洞察` };
+
+      if (action === 'keep') {
+        // 确认入库
+        await this.capture({
+          title: pending.title,
+          category: pending.category,
+          conclusion: pending.conclusion,
+          derivation: pending.derivation,
+          contributor: pending.contributor,
+          golden_quote: pending.golden_quote,
+          source_date: pending.source_date,
+          source_topic: pending.source_topic,
+          tags: this._parseTags(pending.tags),
+          insight_type: pending.insight_type,
+          why_captured: pending.why_captured,
+        });
+        this._run('UPDATE pending_insights SET status = ?, updated_at = datetime(\"now\",\"localtime\") WHERE id = ?', ['kept', id]);
+        this._save();
+        return { success: true, data: { message: '已确认入库 ✅' } };
+      } else if (action === 'merge') {
+        // 保留内容但标记为已合并
+        this._run('UPDATE pending_insights SET status = ?, updated_at = datetime(\"now\",\"localtime\") WHERE id = ?', ['merged', id]);
+        this._save();
+        return { success: true, data: { message: '已标记为合并 🔀' } };
+      } else {
+        // drop — 丢弃
+        this._run('UPDATE pending_insights SET status = ?, updated_at = datetime(\"now\",\"localtime\") WHERE id = ?', ['dropped', id]);
+        this._save();
+        return { success: true, data: { message: '已丢弃 🗑️' } };
+      }
+    } catch (e) {
+      return { success: false, error: `操作失败: ${e.message}` };
+    }
+  }
+
+  // ═══════════════════════════════════
 
   // ── 分类列表 ──────────────────────────
   async getCategories() {

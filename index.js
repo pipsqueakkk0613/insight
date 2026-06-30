@@ -35,7 +35,7 @@ const PORT = parseInt(process.env.PORT || '3456', 10);
 function createMcpServer() {
   const server = new McpServer({
     name: 'insight',
-    version: '1.0.0',
+    version: '2.0.0',
   }, {
     capabilities: { logging: {} },
   });
@@ -64,6 +64,8 @@ function createMcpServer() {
       source_date:  z.string().optional().describe('来源日期，如 2026-07-14'),
       source_topic: z.string().optional().describe('这轮对话的主题关键词'),
       tags:         z.string().optional().describe('标签，逗号分隔'),
+      insight_type: z.string().optional().describe('洞察类型：insight（通用）/ self_cognition（自我认知）/ stance（长期姿态）/ event（事件）。默认 insight'),
+      why_captured: z.string().optional().describe('AI 判定触发的原因简述，如「观点碰撞」「自我清醒」「跨领域迁移」。用于调试和优化捕捉规则'),
     },
     async (params) => {
       const result = await storage.capture(params);
@@ -72,18 +74,76 @@ function createMcpServer() {
   );
 
   server.tool(
-    'list_insights',
-    '列出已保存的洞察列表，可按分类筛选、分页',
+    'capture_pending',
+    `暂存一条候选洞察（不直接入库）。使用场景：AI 检测到可能值得记录的内容，但不确定是否真的足够重要。
+
+下一轮对话或日终时，AI 应调用 review_pending 列出所有候选，逐条请用户确认（keep 入库 / merge 合并 / drop 丢弃）。
+
+参数同 capture_insight，额外增加：
+- trigger_sentence: 触发捕捉的对话原句
+- confidence: AI 自评质量 0-1`,
     {
-      category: z.string().optional().describe('按分类筛选，不填则返回全部'),
-      limit:    z.number().optional().describe('每页条数，默认 20'),
-      offset:   z.number().optional().describe('偏移量，默认 0'),
+      title:            z.string().describe('候选标题'),
+      conclusion:       z.string().describe('一句话结论'),
+      category:         z.string().optional().describe('分类名，默认「待分类」'),
+      derivation:       z.string().optional().describe('推导过程'),
+      contributor:      z.string().optional().describe('user / ai / collaborative'),
+      golden_quote:     z.string().optional().describe('原始金句'),
+      source_topic:     z.string().optional().describe('对话主题关键词'),
+      tags:             z.string().optional().describe('标签，逗号分隔'),
+      insight_type:     z.string().optional().describe('insight / self_cognition / stance / event'),
+      why_captured:     z.string().optional().describe('AI 判定触发的原因'),
+      trigger_sentence: z.string().optional().describe('触发捕捉的对话原句'),
+      confidence:       z.number().optional().describe('自信度 0-1，默认 0.5'),
+    },
+    async (params) => {
+      const result = await storage.capture_pending(params);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'review_pending',
+    '列出所有待确认的候选洞察。AI 应在对话开始时或日终时调用此工具，逐条展示给用户确认。',
+    { limit: z.number().optional().describe('返回条数，默认 10') },
+    async (params) => {
+      const result = await storage.review_pending(params);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'confirm_pending',
+    `确认一条候选洞察的处理方式。
+action 取值：
+- keep:  确认入库（写入 insights 表）
+- merge: 合并到已有洞察（内容保留但标记已合并）
+- drop:  丢弃`,
+    {
+      id:     z.number().describe('候选洞察 ID'),
+      action: z.string().describe('keep / merge / drop'),
+    },
+    async (params) => {
+      const result = await storage.confirm_pending(params);
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    }
+  );
+
+  server.tool(
+    'list_insights',
+    '列出已保存的洞察列表，可按分类、洞察类型筛选、分页',
+    {
+      category:     z.string().optional().describe('按分类筛选，不填则返回全部'),
+      insight_type: z.string().optional().describe('按类型筛选：insight / self_cognition / stance / event'),
+      limit:        z.number().optional().describe('每页条数，默认 20'),
+      offset:       z.number().optional().describe('偏移量，默认 0'),
     },
     async (params) => {
       const result = await storage.list(params);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     }
   );
+
 
   server.tool(
     'search_insights',
@@ -109,6 +169,7 @@ function createMcpServer() {
       derivation:   z.string().optional().describe('新推导过程'),
       golden_quote: z.string().optional().describe('新金句'),
       tags:         z.string().optional().describe('新标签，逗号分隔'),
+      insight_type: z.string().optional().describe('新类型'),
     },
     async (params) => {
       const result = await storage.update(params);
@@ -119,9 +180,7 @@ function createMcpServer() {
   server.tool(
     'delete_insight',
     '删除一条洞察。删除前应让用户确认。',
-    {
-      id: z.number().describe('要删除的洞察 ID'),
-    },
+    { id: z.number().describe('要删除的洞察 ID') },
     async (params) => {
       const result = await storage.delete(params);
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };

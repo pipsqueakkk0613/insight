@@ -70,15 +70,36 @@ STORAGE_TYPE=sqlite
 
 ---
 
-## 五个 AI 工具
+## AI 工具（v2 候选层）
+
+### 直接入库
 
 | 工具 | 做什么 |
 |------|--------|
-| `capture_insight` | 保存洞察，AI 检测到高价值时刻调用 |
-| `list_insights` | 列出洞察，可筛选分页 |
+| `capture_insight` | 保存洞察。新增 `insight_type`（insight/self_cognition/stance/event）和 `why_captured`（AI 说明为什么触发） |
+| `list_insights` | 列出洞察，可按分类、`insight_type` 筛选、分页 |
 | `search_insights` | 搜索洞察 |
 | `update_insight` | 修改洞察 |
 | `delete_insight` | 删除洞察 |
+
+### 候选层（防过度记录）
+
+AI 不确定是否值得记录？先暂存，下轮对话确认。
+
+| 工具 | 做什么 |
+|------|--------|
+| `capture_pending` | 暂存候选洞察（带 `trigger_sentence` 和 `confidence`） |
+| `review_pending` | 列出待确认的候选，AI 逐条展示给用户 |
+| `confirm_pending` | keep（入库）/ merge（合并）/ drop（丢弃） |
+
+### 四种 insight_type
+
+| 类型 | 用于 |
+|------|------|
+| `insight` | 通用认知洞察 |
+| `self_cognition` | 「我是谁」「我怎么看待自己」 |
+| `stance` | 「我怎么看待关系」「长期姿态」 |
+| `event` | 「今天发生了什么」 |
 
 ---
 
